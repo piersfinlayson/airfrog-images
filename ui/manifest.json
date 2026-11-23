@@ -1,0 +1,13 @@
+{
+  "type": "ui",
+  "version": 1,
+  "ui_version": "0.1.0",
+  "min_home_page": 1,
+  "entry": "https://images.airfrog.org/ui/v0.1.0/ui.js",
+  "files": {
+    "https://images.airfrog.org/ui/v0.1.0/ui.js": {
+      "size": 269744,
+      "sha256": "167a4286ad3db8935ab1ddb05796a670abcebf50102523ce3245f8b45405f2c1"
+    }
+  }
+}
