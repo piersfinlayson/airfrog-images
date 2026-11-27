@@ -7,8 +7,7 @@
 // to Airfrog, so the password doesn't reach the page, connects the website
 // once it is in Airfrog's authorised websites, and relays AWP messages
 // without counter and hmac between the page and Airfrog. The window forwards
-// only CLAIM, RELEASE, TARGET_CMD, IDENTIFY and AIRFROG_CMD get commands. See
-// "The bridge" in airfrog-v2/docs/ac3-design.md.
+// only CLAIM, RELEASE, TARGET_CMD, IDENTIFY and AIRFROG_CMD get commands.
 
 import {
     AIRFROG_CMD, AirfrogError, AwpSocket, BRIDGE_KEY, CLAIM, CONNECT_TIMEOUT_MS, ERROR, HEADER_RESPONSE, HELLO,
