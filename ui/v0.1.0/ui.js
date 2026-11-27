@@ -237,15 +237,19 @@ var HMAC_LEN = 32;
 var LOGIN_LABEL = "login";
 var PROOF_LABEL = "airfrog";
 var SESSION_LABEL = "session";
+var PASSWORD_LABEL = "password";
+var SIGNATURE_LEN = 74;
 var DIRECTION_CLIENT = 0;
 var DIRECTION_AIRFROG = 1;
 var PIN_NAME_LEN = 8;
 var CLAIM_MS = 1e4;
 var MAX_TRANSFER_MIN = 4096;
 var EXT_IMAGE_MAGIC = "AFXI";
+var SIGNATURE_MAGIC = "AFSG";
 var EXT_NAME_MAX = 32;
 var EXT_METADATA_MAX = 2048;
 var DOWNLOAD_TIMEOUT_MS = 15e3;
+var MIN_ITERATIONS = 1e5;
 var HELLO = 1;
 var LOGIN = 2;
 var TARGET = 3;
@@ -300,6 +304,8 @@ var ERROR_NO_SPACE = 13;
 var ERROR_IMAGE_INVALID = 16;
 var ERROR_RESTARTING = 17;
 var ERROR_EXISTS = 18;
+var ERROR_NOT_PERMITTED = 20;
+var ERROR_SIGNATURE_INVALID = 21;
 var CLOSE_PROTOCOL_ERROR = 4e3;
 var CLOSE_BAD_COUNTER_OR_HMAC = 4001;
 var CLOSE_LOGIN_FAILED = 4002;
@@ -347,7 +353,19 @@ var Command = Object.freeze({
   ADD_AUTHORISED_WEBSITE: 32,
   REMOVE_AUTHORISED_WEBSITE: 33,
   ADD_HOST_ALIAS: 34,
-  REMOVE_HOST_ALIAS: 35
+  REMOVE_HOST_ALIAS: 35,
+  SET_WIFI_AP: 36
+});
+var Interface = Object.freeze({
+  /** WiFi station, the home network. */
+  STATION: 0,
+  SERIAL: 1,
+  /** Access point. */
+  AP: 2,
+  /** Access point, during first setup. */
+  AP_FIRST_SETUP: 3,
+  /** Access point, started with the recovery button. */
+  AP_BUTTON: 4
 });
 var Firmware = Object.freeze({
   NONE: 0,
@@ -420,8 +438,8 @@ var RestartMode = Object.freeze({
 var ExtensionFlag = Object.freeze({
   /** The extension's Tab checkbox is ticked. */
   TAB: 1,
-  /** Installed from a file, not the repository. */
-  SIDE_LOADED: 2
+  /** Installed without a signature. */
+  UNSIGNED: 2
 });
 var SetExtensionFlag = Object.freeze({
   /** The extension's Tab checkbox is ticked. */
@@ -504,6 +522,7 @@ var FLAGS_OFFSET = 2;
 var COUNTER_OFFSET = 8;
 var HMAC_OFFSET = 16;
 var HEADER_LEN = 48;
+var SET_PASSWORD_LEN = 48;
 var encoder = new TextEncoder();
 var decoder = new TextDecoder();
 var FieldReader = class {
@@ -640,12 +659,21 @@ function readHello(r) {
   f.ns = r.bytesOf(16);
   f.salt = r.bytesOf(16);
   f.iterations = r.u32();
+  f.interface = r.u16();
+  f.keyCount = r.u16();
+  f.keys = r.list(f.keyCount, () => readReleaseKey(r));
+  f.manifestUrl = r.text();
   return f;
 }
 function decodeHello(p) {
   const r = new FieldReader(p);
   const f = readHello(r);
   return r.short ? null : f;
+}
+function readReleaseKey(r) {
+  const f = {};
+  f.key = r.bytesOf(32);
+  return f;
 }
 function writeLogin(w, f) {
   w.bytesOf(f.nc, 16);
@@ -775,6 +803,7 @@ function readFwInfo(r) {
   r.bytesOf(2);
   f.wamr = r.bytesOf(3);
   r.bytesOf(1);
+  f.sha256 = r.bytesOf(32);
   f.commit = r.left() >= 2 ? r.text() : null;
   return f;
 }
@@ -782,6 +811,29 @@ function decodeFwInfo(p) {
   const r = new FieldReader(p);
   const f = readFwInfo(r);
   return r.short ? null : f;
+}
+function readWifiAp(r) {
+  const f = {};
+  f.state = r.u16();
+  f.stations = r.u16();
+  f.ipv4 = r.bytesOf(4);
+  f.ipv6 = r.bytesOf(16);
+  f.ssid = r.text();
+  return f;
+}
+function decodeWifiAp(p) {
+  const r = new FieldReader(p);
+  const f = readWifiAp(r);
+  return r.short ? null : f;
+}
+function writeSetWifiAp(w, f) {
+  w.text(f.ssid);
+  w.text(f.password);
+}
+function encodeSetWifiAp(f) {
+  const w = new FieldWriter();
+  writeSetWifiAp(w, f);
+  return w.bytes();
 }
 function writeSetPassword(w, f) {
   w.bytesOf(f.key, 32);
@@ -863,6 +915,7 @@ function writeExtBegin(w, f) {
   w.bytesOf(f.sha256, 32);
   w.u16(f.flags);
   w.bytesOf(null, 2);
+  w.bytesOf(f.signature, 74);
 }
 function encodeExtBegin(f) {
   const w = new FieldWriter();
@@ -997,10 +1050,13 @@ var CLOSED = {
 var CLOSE_ANOTHER = "Close another page or program using Airfrog";
 var RECONNECTING = "Reconnecting\u2026";
 var INVALID_VALUE = "Invalid value.";
+var UNSUPPORTED_FIRMWARE = "Unsupported Airfrog firmware.";
 var ERRORS = {
   TIMEOUT: () => "No response from Airfrog.",
   PASSWORD_REQUIRED: () => "Password required.",
   LOGIN_FAILED: () => "Incorrect password.",
+  /** HELLO's iterations is below MIN_ITERATIONS, so the client doesn't log in. */
+  ITERATIONS_TOO_LOW: () => UNSUPPORTED_FIRMWARE,
   LOGIN_BLOCKED: (s) => s === 1 ? "Too many failed login attempts. Retry in 1 second." : s === null || s === void 0 ? "Too many failed login attempts. Retry later." : `Too many failed login attempts. Retry in ${s} seconds.`,
   PROOF_MISMATCH: () => "Login failed. Check the Airfrog address.",
   PASSWORD_CHANGED: () => `${CLOSED.PASSWORD_CHANGED} Reconnect with the new password.`,
@@ -1023,6 +1079,8 @@ var ERRORS = {
   EXTENSION_UNSUPPORTED: () => "Extension not supported by this Airfrog.",
   NO_SPACE: () => "No room for the extension. Remove an extension, then try again.",
   IMAGE_INVALID: () => INVALID_FIRMWARE_FILE,
+  NOT_PERMITTED: () => "Not permitted over this connection.",
+  SIGNATURE_INVALID: () => "Invalid signature.",
   RESTARTING: () => RESTARTING,
   CODE: (code) => ERROR_CODES[code] ?? `Airfrog error ${code}.`,
   TRANSFER_TOO_LARGE: (len, max) => `Transfer of ${len} bytes is larger than Airfrog's limit of ${max}`,
@@ -1041,13 +1099,21 @@ var CONNECTION = {
   CONNECTING: "Connecting to Airfrog\u2026",
   LOGGING_IN: "Logging in\u2026",
   LOG_IN_AGAIN: `${CLOSED.PASSWORD_CHANGED} Log in again.`,
+  /** The login card after the first setup password or a reset over the recovery button AP. */
+  PASSWORD_SAVED: "Password saved. Log in with the new password.",
   /** Followed by a link to the recovery page. */
   FORGOTTEN: "Forgotten password: See ",
+  /** In place of FORGOTTEN over the access point, other than the one started with the recovery button. */
+  FORGOTTEN_AP: "Forgotten password: Hold the recovery button for 3 seconds then reload this page.",
   /** The login card's title and button. */
   LOG_IN: "Log in",
   PASSWORD: "Password",
   INVALID_ADDRESS: (host) => `Invalid address ${host}.`,
   NOT_AIRFROG: "Not an Airfrog at this address. Check the address.",
+  /** Firmware with another manifest address or other release keys, in the airfrog.org UI and its bridge window. */
+  OTHER_FIRMWARE: UNSUPPORTED_FIRMWARE,
+  /** The heading of the login card's reset fields over the access point started with the recovery button. */
+  RESET_PASSWORD: "Reset password",
   /** A connection closed by this page, or closed before a command. */
   CLOSED: "Connection to Airfrog closed."
 };
@@ -1060,6 +1126,97 @@ var SETTINGS = {
   INVALID_VALUE,
   SAVE: "Save"
 };
+var NETWORK = {
+  SCANNING: "Scanning\u2026",
+  SCAN_FAILED: "Scan failed. Try again.",
+  NO_NETWORKS: "No networks found.",
+  JOINING: (ssid) => `Airfrog joining ${ssid}.`,
+  /** @returns {LinkedText} */
+  JOINING_RECONNECT: (ssid, url) => [`Airfrog joining ${ssid}. Open `, { url }, " on that network if this page doesn't reconnect."],
+  NOT_JOINED: (ssid) => `Airfrog failed to connect to ${ssid}. Check the network name and password, then select Save and connect.`,
+  /** @returns {LinkedText} the warning card while this page uses AP mode after Airfrog joined ssid */
+  AP_JOINED: (ssid, url) => [`Airfrog joined ${ssid}. The Airfrog Access Point will be disabled in 2 minutes. Open `, { url }, ` on ${ssid}.`],
+  /** @returns {LinkedText} the status once the connection through AP mode closes */
+  JOINED: (ssid, url) => [`Airfrog joined ${ssid}. Open `, { url }, " on that network."],
+  /** @returns {LinkedText} */
+  AP_STOPPED: (ssid, url) => ["AP mode stopped. Open ", { url }, ` on ${ssid}.`],
+  HOSTNAME_CHANGED: (name) => `Hostname changed to ${name}.`,
+  /** @returns {LinkedText} */
+  HOSTNAME_RECONNECT: (name, url) => [`Hostname changed to ${name}. Open `, { url }, " if this page doesn't reconnect."],
+  WIFI_TITLE: "WiFi",
+  WIFI_CONNECTED: "Connected",
+  WIFI_CONNECTING: "Connecting",
+  WIFI_NOT_CONNECTED: "Not connected",
+  WIFI_NETWORK_NOT_FOUND: "Network not found",
+  WIFI_WRONG_PASSWORD: "Wrong password",
+  WIFI_FAILED: "Connection failed",
+  WIFI_NOT_SET: "Not set",
+  NETWORK_ROW: "Network",
+  SIGNAL_ROW: "Signal",
+  IP_ADDRESS: "IP address",
+  /** A WiFi card row and a Join a network field. */
+  SUBNET_MASK: "Subnet mask",
+  GATEWAY: "Gateway",
+  DNS_SERVER: "DNS server",
+  IP_ASSIGNMENT: "IP assignment",
+  MANUAL: "Manual",
+  AUTOMATIC_DHCP: "Automatic (DHCP)",
+  IPV6_ADDRESS: "IPv6 address",
+  MAC_ADDRESS: "MAC address",
+  AP_MODE: "AP mode",
+  AP_MODE_TIP: "Airfrog Access Point used for setup and recovery.",
+  STOP_AP_MODE: "Stop AP mode",
+  POWER_SAVE: "WiFi power save",
+  POWER_SAVE_TIP: "Uses less power. Airfrog responds more slowly.",
+  RESCAN_INTERVAL: "Rescan interval (s)",
+  RESCAN_INTERVAL_TIP: "Minimum 60 s. 0: disabled.",
+  INVALID_RESCAN_INTERVAL: "Invalid rescan interval. Use 0, or 60 s or more.",
+  RESCAN_THRESHOLD: "Rescan threshold (dB)",
+  RESCAN_THRESHOLD_TIP: "1 to 100 dB.",
+  INVALID_RESCAN_THRESHOLD: "Invalid rescan threshold. Use 1 to 100 dB.",
+  JOIN_TITLE: "Join a network",
+  JOIN_TIP: "Connect Airfrog to another WiFi network. Saving disconnects it from its current network.",
+  NETWORK_NAME: "Network name",
+  INVALID_SSID: "Invalid WiFi network name. Use 1 to 32 characters.",
+  SCAN: "Scan",
+  /** A scanned network's padlock. */
+  REQUIRES_PASSWORD: "Requires a password",
+  /** A scanned network whose security Airfrog doesn't support. */
+  NOT_SUPPORTED: "Not supported",
+  PASSWORD_OPTIONAL: "Password (optional)",
+  /** With the password field's value while the stored password is kept. */
+  PASSWORD_TIP: (kept) => `${kept}: the stored password. Empty: open network.`,
+  INVALID_PASSWORD: "Invalid WiFi password. Use 8 to 63 characters, or none for an open network.",
+  STATIC_IP: "Static IP address",
+  STATIC_IP_TIP: "Assigns Airfrog a fixed IP address instead of one from your router.",
+  GATEWAY_OPTIONAL: "Gateway (optional)",
+  DNS_SERVER_OPTIONAL: "DNS server (optional)",
+  INVALID_IP_ADDRESS: "Invalid IP address. Use four numbers 0 to 255 separated by dots.",
+  INVALID_SUBNET_MASK: "Invalid subnet mask. Use four numbers 0 to 255 separated by dots.",
+  INVALID_GATEWAY: "Invalid gateway. Use four numbers 0 to 255 separated by dots.",
+  INVALID_DNS_SERVER: "Invalid DNS server. Use four numbers 0 to 255 separated by dots.",
+  ZERO_IP_ADDRESS: "IP address can't be 0.0.0.0.",
+  /** A subnet mask of 0.0.0.0 or with its bits not in one run. */
+  SUBNET_MASK_BITS: "Invalid subnet mask. For example, use 255.255.255.0.",
+  SAVE_AND_CONNECT: "Save and connect",
+  /** The Hostname card's title and field. */
+  HOSTNAME: "Hostname",
+  HOSTNAME_TIP: "Name of this Airfrog on your network. Changing it causes Airfrog to disconnect and reconnect.",
+  INVALID_HOSTNAME: "Invalid hostname. Use 1 to 63 letters, digits and hyphens, not starting or ending with a hyphen.",
+  HOST_ALIASES: "Host aliases",
+  HOST_ALIASES_TIP: "Other names for Airfrog, for example from your router's DNS. Up to 4, separated by spaces.",
+  TOO_MANY_ALIASES: "Too many host aliases. Maximum 4.",
+  INVALID_ALIAS: (alias) => `Invalid host alias ${alias}. Use up to 253 characters: labels of 1 to 63 letters, digits and hyphens, separated by dots.`
+};
+var WIFI_AP = {
+  TITLE: "Airfrog Access Point",
+  TIP: NETWORK.AP_MODE_TIP,
+  NAME: "Network name",
+  PASSWORD: "Password",
+  /** Airfrog then restarts the access point, which closes this connection. */
+  SAVED: "Airfrog Access Point settings saved. Reconnect with the new password.",
+  INVALID_PASSWORD: "Password must be 8 to 63 characters."
+};
 var UPDATE = {
   /** The New firmware file tooltip, with the update image's file name. */
   FILE_HELP: (file) => `Airfrog firmware image ${file} from airfrog.org.`,
@@ -1067,6 +1224,9 @@ var UPDATE = {
   /** Airfrog firmware for another model. */
   WRONG_MODEL: "Invalid firmware file (incorrect Airfrog model).",
   UNSIGNED: "Unsigned firmware.",
+  UNSIGNED_NOT_HERE: "Unsigned firmware can only be installed over the Airfrog Access Point started with the recovery button.",
+  /** With the running firmware's version as VALUES.VERSION writes it. */
+  OLDER_NOT_HERE: (version) => `Firmware older than ${version} can only be installed over the Airfrog Access Point started with the recovery button.`,
   /** The Version row's note. */
   LATEST: "Latest release.",
   /** Followed by why the firmware manifest isn't available. */
@@ -1173,6 +1333,8 @@ var VALUES = {
   OPERATION: (operation) => `operation ${operation}`,
   VERSION: (version) => `v${version}`,
   WITH_COMMIT: (version, commit) => `${version} (${commit})`,
+  /** An installed extension's version with its note: unsigned, latest or depublished. */
+  WITH_NOTE: (version, note) => `${version} (${note})`,
   MB: (size) => `${size} MB`,
   KB: (size) => `${size} KB`,
   DBM: (rssi) => `${rssi} dBm`
@@ -1197,8 +1359,9 @@ var EXTENSIONS = {
   TAB_CHECKBOX: (name) => `${name} tab`,
   /** After the installed version. */
   LATEST: (version) => `latest ${version}`,
-  SIDE_LOADED: "from file",
-  DEPUBLISHED: "Depublished",
+  UNSIGNED: "unsigned",
+  UNSIGNED_NOT_HERE: "Unsigned extensions can only be installed with the Airfrog CLI.",
+  DEPUBLISHED: "depublished",
   RUNNING,
   STOPPED,
   UI_ONLY: "UI only",
@@ -1217,7 +1380,7 @@ var EXTENSIONS = {
   ANY_TARGET: "Any target",
   OTHER_TARGETS: "Other targets",
   COUNT: (shown, total) => `${shown} of ${total} available extensions`,
-  SIDE_LOAD_CONFIRM: "Extensions added from a file have full access to Airfrog.",
+  UNSIGNED_CONFIRM: "Unsigned extensions have full access to Airfrog.",
   REMOVE_CONFIRM: (name) => `Are you sure you want to remove ${name}?`,
   INSTALLING: (name, version) => `Installing ${name} ${version}\u2026`,
   INSTALLED: (name, version) => `Installed ${name} ${version}.`,
@@ -1254,20 +1417,23 @@ var RELEASE_LIST = {
 var HOME_PAGE = {
   TITLE: AIRFROG,
   LOADING: "Loading\u2026",
-  DOWNLOAD_FAILED: "Download failed. Check internet access.",
+  DOWNLOAD_FAILED: "Check this browser's internet access.",
   DOWNLOAD_HTTP: (status) => `Download failed (HTTP ${status}).`,
   DOWNLOAD_TIMED_OUT: "Download failed (timed out).",
   RELEASE_LIST_SIGNATURE: RELEASE_LIST.SIGNATURE,
   RELEASE_LIST_INVALID: RELEASE_LIST.INVALID,
   MANIFEST_SIGNATURE: "Invalid signature.",
   MANIFEST_INVALID: "Invalid manifest.",
-  NO_MANIFEST_KEY: "Rebuild firmware with CONFIG_AIRFROG_MANIFEST_KEY.",
   NEWER_FIRMWARE: "Newer firmware required. Update firmware.",
   DOWNLOAD_CORRUPT: "Download corrupt. Reload the page.",
   INCOMPLETE: "Incomplete release.",
   START_FAILED: "Start failed. Reload the page.",
   BRIDGE_NOT_LOADED: (reason) => `Bridge window not loaded. ${reason}`,
-  UI_FAILED: "Airfrog UI failed to load. Reload the page."
+  UI_FAILED: "Airfrog UI failed to load. Reload the page.",
+  /** Over the access point, in place of the full user interface. */
+  ACCESS_POINT: "Airfrog Access Point. Full Airfrog UI not available.",
+  /** After ACCESS_POINT over the access point started with the recovery button. */
+  ACCESS_POINT_BUTTON: "The Airfrog Access Point will be disabled 5 minutes after the recovery button was pressed."
 };
 var BRIDGE = {
   /** The browser tab title. */
@@ -1285,6 +1451,8 @@ var BRIDGE = {
   DISCONNECT: "Disconnect",
   DISCONNECTED: (site, host) => `${site} was disconnected from ${host}.`,
   NOT_CONNECTED: (site, host) => `${site} couldn't connect to ${host}.`,
+  /** The bridge window opened over the access point. */
+  ON_AP: (site, host) => `${site} can't connect to ${host} over the Airfrog Access Point.`,
   RECONNECT_FROM: (site) => `Reconnect from ${site}.`,
   CLOSE: "Close",
   PASSWORD_CHANGED: (host) => `${host}'s password was changed.`,
@@ -1318,7 +1486,7 @@ var COMMISSIONING_FIRMWARE = {
   CONFIRM_INSTALL: (version) => `Install firmware ${version}? The Airfrog settings are erased.`,
   /** CONFIRM_INSTALL's button. */
   INSTALL: "Install",
-  MANIFEST_KEY_NOT_SET: "Manifest key not set.",
+  RELEASE_KEYS_NOT_SET: "Release keys not set.",
   /** A download's name. */
   RELEASE_LIST: "Release list",
   /** A download's name. */
@@ -1432,7 +1600,9 @@ var ERROR_CODES2 = {
   [ERROR_EXTENSION_UNSUPPORTED]: "EXTENSION_UNSUPPORTED",
   [ERROR_NO_SPACE]: "NO_SPACE",
   [ERROR_IMAGE_INVALID]: "IMAGE_INVALID",
-  [ERROR_RESTARTING]: "RESTARTING"
+  [ERROR_RESTARTING]: "RESTARTING",
+  [ERROR_NOT_PERMITTED]: "NOT_PERMITTED",
+  [ERROR_SIGNATURE_INVALID]: "SIGNATURE_INVALID"
 };
 function errorFromPayload(payload) {
   const error = decodeError(payload);
@@ -1513,6 +1683,10 @@ var Hello = class _Hello {
   hasPassword() {
     return (this.flags & FLAG_PASSWORD) !== 0;
   }
+  /** @returns {Array<Uint8Array>} the firmware's release keys, the release key first */
+  releaseKeys() {
+    return this.keys.map((k) => k.key);
+  }
 };
 function concat(...parts) {
   const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
@@ -1526,6 +1700,14 @@ function concat(...parts) {
 function passwordKey(password, salt, iterations) {
   return pbkdf2HmacSha256(ASCII.encode(password), salt, iterations);
 }
+var loginKeyCache = null;
+function sameBytes(a, b) {
+  return a.length === b.length && a.every((x, i) => x === b[i]);
+}
+function cachedLoginKey(password, salt, iterations) {
+  const c = loginKeyCache;
+  return c && c.password === password && c.iterations === iterations && sameBytes(c.salt, salt) ? c.k : null;
+}
 function equal(a, b) {
   let diff = a.length ^ b.length;
   for (let i = 0; i < a.length && i < b.length; i++) {
@@ -1536,12 +1718,43 @@ function equal(a, b) {
 var AwpSocket = class _AwpSocket {
   /**
    * Opens the connection, reads HELLO and logs in where Airfrog has a
-   * password.
+   * password. LOGIN follows HELLO at once: without K for HELLO's salt and
+   * iterations, the connection is closed, K is computed and kept, and a new
+   * connection logs in with it.
    * @param {string} host - Airfrog's host, with :port when it isn't 80
    * @param {string|null} password - ignored when Airfrog doesn't have one
+   * @param {object} [options]
+   * @param {function(Hello): AirfrogError|null} [options.checkHello] -
+   *        called with HELLO before logging in. An error it returns closes
+   *        the connection and rejects with it
+   * @param {boolean} [options.login] - false resolves after HELLO without
+   *        logging in
    * @returns {Promise<AwpSocket>}
    */
-  static open(host, password) {
+  static async open(host, password, options = {}) {
+    for (let attempt = 0; ; attempt++) {
+      let needed = null;
+      try {
+        return await _AwpSocket.#openOnce(host, password, {
+          ...options,
+          onKeyNeeded: (salt, iterations) => {
+            needed = { salt, iterations };
+          }
+        });
+      } catch (e) {
+        if (!needed || attempt >= 2) {
+          throw e;
+        }
+        loginKeyCache = {
+          password,
+          salt: needed.salt.slice(),
+          iterations: needed.iterations,
+          k: passwordKey(password, needed.salt, needed.iterations)
+        };
+      }
+    }
+  }
+  static #openOnce(host, password, { checkHello: checkHello2 = null, login = true, onKeyNeeded = null } = {}) {
     return new Promise((resolve, reject) => {
       let ws;
       try {
@@ -1550,11 +1763,14 @@ var AwpSocket = class _AwpSocket {
         reject(new AirfrogError("CONNECT", `invalid host ${host}`, CONNECTION.INVALID_ADDRESS(host)));
         return;
       }
-      new _AwpSocket(ws, password, resolve, reject);
+      new _AwpSocket(ws, password, resolve, reject, { checkHello: checkHello2, login, onKeyNeeded });
     });
   }
-  constructor(ws, password, resolve, reject) {
+  constructor(ws, password, resolve, reject, { checkHello: checkHello2 = null, login = true, onKeyNeeded = null } = {}) {
     this.ws = ws;
+    this.checkHello = checkHello2;
+    this.login = login;
+    this.onKeyNeeded = onKeyNeeded;
     this.tx = 0;
     this.rx = 0;
     this.key = null;
@@ -1697,14 +1913,14 @@ var AwpSocket = class _AwpSocket {
     }
     this.rx = counter;
     if (!this.opened()) {
-      this.login(type, flags, payload);
+      this.loggingIn(type, flags, payload);
     } else if (this._onmessage) {
       this._onmessage(type, flags, payload);
     } else {
       this.held.push([type, flags, payload]);
     }
   }
-  login(type, flags, payload) {
+  loggingIn(type, flags, payload) {
     if (!this.hello) {
       if (type !== HELLO) {
         this.fail(new AirfrogError("INVALID_MESSAGE", `${hex(type)} before HELLO`), CLOSE_PROTOCOL_ERROR);
@@ -1721,19 +1937,29 @@ var AwpSocket = class _AwpSocket {
       }
       this.hello = hello;
       this.helloPayload = payload;
-      if (!hello.hasPassword()) {
+      const refused = this.checkHello?.(hello);
+      if (refused) {
+        this.fail(refused);
+        return;
+      }
+      if (!this.login || !hello.hasPassword()) {
         this.loggedIn();
         return;
       }
+      if (hello.iterations < MIN_ITERATIONS) {
+        this.fail(new AirfrogError("ITERATIONS_TOO_LOW", hello.iterations));
+        return;
+      }
       if (this.password === null || this.password === void 0) {
-        this.fail(new AirfrogError("PASSWORD_REQUIRED"));
+        this.fail(new AirfrogError("PASSWORD_REQUIRED", hello));
         return;
       }
-      if (hello.iterations === 0) {
-        this.fail(new AirfrogError("INVALID_MESSAGE", "HELLO has a password and zero iterations"), CLOSE_PROTOCOL_ERROR);
+      this.k = cachedLoginKey(this.password, hello.salt, hello.iterations);
+      if (!this.k) {
+        this.onKeyNeeded?.(hello.salt, hello.iterations);
+        this.fail(new AirfrogError("CLOSED", null, CONNECTION.CLOSED));
         return;
       }
-      this.k = passwordKey(this.password, hello.salt, hello.iterations);
       this.nc = crypto.getRandomValues(new Uint8Array(NONCE_LEN));
       const proof = hmacSha256(this.k, ASCII.encode(LOGIN_LABEL), hello.ns, this.nc);
       this.send(LOGIN, encodeLogin({ nc: this.nc, proof }));
@@ -1782,7 +2008,6 @@ function errorFromBridge(close) {
 }
 
 // js/urls.js
-var AIRFROG_TLD = "https://airfrog.org/";
 var RECOVERY = "https://airfrog.org/recovery";
 
 // js/bridge.js
@@ -2104,7 +2329,7 @@ async function listed(relay, origin) {
   }
   return list.website.includes(origin);
 }
-async function startBridge(container) {
+async function startBridge(container, { checkHello: checkHello2 = null } = {}) {
   const origin = bridgeOrigin(location.hash);
   if (!origin) {
     location.replace(`http://${location.host}/`);
@@ -2139,7 +2364,7 @@ async function startBridge(container) {
   let password = null;
   while (!socket) {
     try {
-      socket = await AwpSocket.open(host, password);
+      socket = await AwpSocket.open(host, password, { checkHello: checkHello2 });
     } catch (e) {
       if (["PASSWORD_REQUIRED", "LOGIN_FAILED", "LOGIN_BLOCKED"].includes(e.code)) {
         password = await view.askPassword(host, site, e.code === "PASSWORD_REQUIRED" ? null : e.message);
@@ -2286,6 +2511,33 @@ async function startBridge(container) {
   checkTimer = setTimeout(check2, CHECK_MS);
 }
 
+// commissioning/release-keys.js
+var RELEASE_KEYS = ["c44615e017975c65c1248565a67a4918e315aeab4fc0a67189b0f04692c6f85d", "8ef11f983e35a9750449ccdd998252a1d08fd2378e9f39334a6ea24dadb8710d"];
+var AIRFROG_MANIFEST = "https://meta.piers.rocks/airfrog/manifest.json";
+
+// js/setup/bytes.js
+var encoder2 = new TextEncoder();
+var decoder2 = new TextDecoder();
+var FieldError = class extends Error {
+  constructor(what) {
+    super(UNRECOGNISED_REPLY);
+    this.detail = what;
+    this.name = "FieldError";
+  }
+};
+function hex2(bytes) {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// ui/src/firmware-check.js
+function checkHello(hello, { manifest = AIRFROG_MANIFEST, keys = RELEASE_KEYS } = {}) {
+  const theirs = hello.releaseKeys().map(hex2);
+  if (hello.manifestUrl === manifest && theirs.some((k) => keys.includes(k))) {
+    return null;
+  }
+  return new AirfrogError("OTHER_FIRMWARE", `${hello.manifestUrl} ${theirs.join(",")}`, CONNECTION.OTHER_FIRMWARE);
+}
+
 // js/setup/dom.js
 function h(tag, attrs = {}, ...children) {
   const e = document.createElement(tag);
@@ -2424,12 +2676,69 @@ function prompt() {
   return { element, ask };
 }
 
+// js/signed.js
+var ESP_IMAGE_MAGIC = 233;
+var ESP_HEADER_LEN = 24;
+var ESP_HASH_APPENDED = 23;
+var ESP_SEGMENT_HEADER_LEN = 8;
+var ESP_HASH_LEN = 32;
+var MAGIC = new TextEncoder().encode(SIGNATURE_MAGIC);
+function firmwareImageLength(data) {
+  if (data.length < ESP_HEADER_LEN || data[0] !== ESP_IMAGE_MAGIC) {
+    return null;
+  }
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  let at = ESP_HEADER_LEN;
+  for (let i = 0; i < data[1]; i++) {
+    if (at + ESP_SEGMENT_HEADER_LEN > data.length) {
+      return null;
+    }
+    at += ESP_SEGMENT_HEADER_LEN + view.getUint32(at + 4, true);
+    if (at > data.length) {
+      return null;
+    }
+  }
+  at = Math.floor(at / 16) * 16 + 16;
+  if (data[ESP_HASH_APPENDED] === 1) {
+    at += ESP_HASH_LEN;
+  }
+  return at <= data.length ? at : null;
+}
+function extensionImageLength(data) {
+  const h2 = decodeExtImage(data);
+  if (!h2 || h2.magic !== EXT_IMAGE_MAGIC) {
+    return null;
+  }
+  const end = h2.moduleOffset + h2.moduleLen;
+  return end <= data.length && h2.metadataOffset + h2.metadataLen <= end ? end : null;
+}
+function signatureFor(signature, keys) {
+  const id = signature?.subarray(2, 10);
+  return id && keys.some((k) => k.subarray(0, 8).every((b, i) => b === id[i])) ? signature : null;
+}
+function readSignedFile(file, kind) {
+  const end = kind === "firmware" ? firmwareImageLength(file) : extensionImageLength(file);
+  if (end === null) {
+    return null;
+  }
+  const image = file.subarray(0, end);
+  if (end === file.length) {
+    return { image, signature: null };
+  }
+  const block = end + (4 - end % 4) % 4;
+  if (file.length !== block + MAGIC.length + SIGNATURE_LEN || file.subarray(end, block).some((b) => b !== 0) || MAGIC.some((b, i) => file[block + i] !== b)) {
+    return null;
+  }
+  return { image, signature: file.subarray(block + MAGIC.length) };
+}
+
 // js/airfrog.js
 var IDENTIFY_TIMEOUT_MS = 15e3;
 var RESET_TIMEOUT_MS = 35e3;
 var EXT_WRITE_TIMEOUT_MS = 1e4;
 var EXT_FINISH_TIMEOUT_MS = 3e4;
 var EMPTY = new Uint8Array(0);
+var UNSIGNED = new Uint8Array(SIGNATURE_LEN);
 var WINDOW_POLL_MS = 500;
 var BRIDGE_CLOSE_WAIT_MS = 2e3;
 var WINDOW_FEATURES = "popup,width=560,height=600";
@@ -2486,6 +2795,14 @@ var BridgePipe = class _BridgePipe {
       return;
     }
     this.heard = true;
+    if (message2.close?.code === "ACCESS_POINT") {
+      this.ended(new AirfrogError(
+        "ACCESS_POINT",
+        null,
+        BRIDGE.ON_AP(siteName(location.origin), new URL(this.origin).host)
+      ));
+      return;
+    }
     if (message2.close) {
       this.ended(errorFromBridge(message2.close));
       return;
@@ -2739,13 +3056,44 @@ var Airfrog = class _Airfrog extends EventTarget {
    * @param {string|null} [password] - ignored when Airfrog doesn't have
    *        one. Without one, where Airfrog has one, the connection closes
    *        with PASSWORD_REQUIRED
+   * @param {object} [options]
+   * @param {function(Hello): AirfrogError|null} [options.checkHello] -
+   *        called with HELLO before logging in. An error it returns closes
+   *        the connection and rejects with it
    * @returns {Promise<Airfrog>}
    */
-  static async connect(host, password = null) {
-    const socket = await AwpSocket.open(host, password);
+  static async connect(host, password = null, { checkHello: checkHello2 = null } = {}) {
+    const socket = await AwpSocket.open(host, password, { checkHello: checkHello2 });
     const airfrog = new _Airfrog(host, socket.hello, socket);
     await airfrog.#firstTarget();
     return airfrog;
+  }
+  /**
+   * Replaces Airfrog's password without logging in, with AIRFROG_CMD
+   * SET_PASSWORD sent before LOGIN. Airfrog allows it only over the access
+   * point started with the recovery button, and otherwise fails it with
+   * NOT_PERMITTED. Airfrog then closes every connection with
+   * PASSWORD_CHANGED. For Airfrog's home page, as `connect()`.
+   * @param {string} host - as for `connect()`
+   * @param {string} password - the new password. An empty password removes it
+   * @param {object} [options] - as for `connect()`
+   * @returns {Promise<void>}
+   */
+  static async resetPassword(host, password, { checkHello: checkHello2 = null } = {}) {
+    const probe = await AwpSocket.open(host, null, { checkHello: checkHello2, login: false });
+    const { iterations } = probe.hello;
+    probe.close();
+    const { key, salt } = newPasswordKey(password, iterations);
+    const socket = await AwpSocket.open(host, null, { checkHello: checkHello2, login: false });
+    const airfrog = new _Airfrog(host, socket.hello, socket);
+    try {
+      if (socket.hello.iterations !== iterations) {
+        throw new AirfrogError("INVALID_MESSAGE", `HELLO's iterations changed from ${iterations}`);
+      }
+      await airfrog.#sendPassword(key, salt);
+    } finally {
+      airfrog.close();
+    }
   }
   /**
    * Opens the bridge window: Airfrog's home page in a new window, which
@@ -2754,7 +3102,8 @@ var Airfrog = class _Airfrog extends EventTarget {
    * because a browser opens a window only then.
    *
    * Resolves once the user has logged in in the bridge window. Rejects with
-   * CLOSED when the user closes that window first.
+   * CLOSED when the user closes that window first, and with ACCESS_POINT
+   * when the window opened over the Airfrog Access Point.
    * @param {string} host - as for `connect()`
    * @returns {Promise<Airfrog>}
    */
@@ -2809,6 +3158,22 @@ var Airfrog = class _Airfrog extends EventTarget {
   /** @returns {number} HELLO's max_transfer: the most bulk data in one request or response */
   getMaxTransfer() {
     return this.#hello.maxTransfer;
+  }
+  /** @returns {number} HELLO's interface, how this connection reaches Airfrog: an Interface */
+  getInterface() {
+    return this.#hello.interface;
+  }
+  /** @returns {string} HELLO's manifest_url: the address of the firmware's Airfrog manifest */
+  getManifestUrl() {
+    return this.#hello.manifestUrl;
+  }
+  /** @returns {Array<Uint8Array>} HELLO's keys: the firmware's release keys, the release key first */
+  getReleaseKeys() {
+    return this.#hello.releaseKeys();
+  }
+  /** @returns {boolean} whether Airfrog had a password when this connection opened */
+  hasPassword() {
+    return this.#hello.hasPassword();
   }
   /** @returns {TargetInfo} the last TARGET Airfrog sent */
   getTarget() {
@@ -2994,7 +3359,13 @@ var Airfrog = class _Airfrog extends EventTarget {
   /**
    * Sets, changes or removes Airfrog's password with AIRFROG_CMD
    * SET_PASSWORD. The password doesn't leave this page: Airfrog receives K,
-   * derived with a new random salt and HELLO's iterations.
+   * derived with a new random salt and HELLO's iterations. Removing it
+   * sends K and salt as zeros. On a logged-in connection K is sent
+   * encrypted, XORed with HMAC-SHA256(S, PASSWORD_LABEL ‖ salt) where S is
+   * the connection's key, removal included. In an extension UI with full
+   * access K is sent in the clear and the Airfrog UI encrypts it with its
+   * own connection's key. The password rule, PASSWORD_RULE in messages.js,
+   * isn't checked here.
    *
    * Airfrog then closes every connection, this one included, with
    * PASSWORD_CHANGED, which the `close` event reports.
@@ -3002,12 +3373,46 @@ var Airfrog = class _Airfrog extends EventTarget {
    * @returns {Promise<void>}
    */
   async setPassword(password) {
-    let fields = encodeSetPassword({});
-    if (password !== "") {
-      const salt = crypto.getRandomValues(new Uint8Array(SALT_LEN));
-      fields = encodeSetPassword({ key: passwordKey(password, salt, this.#hello.iterations), salt });
+    const { key, salt } = newPasswordKey(password, this.#hello.iterations);
+    await this.#sendPassword(key, salt);
+  }
+  /** Sends SET_PASSWORD with key, encrypted on a logged-in connection, and salt. */
+  async #sendPassword(key, salt) {
+    const s = this.#pipe.key;
+    if (s) {
+      const pad = hmacSha256(s, new TextEncoder().encode(PASSWORD_LABEL), salt);
+      key.forEach((b, i) => {
+        key[i] = b ^ pad[i];
+      });
     }
-    await this.airfrogCmd(Command.SET_PASSWORD, fields, CONNECT_TIMEOUT_MS);
+    await this.airfrogCmd(Command.SET_PASSWORD, encodeSetPassword({ key, salt }), CONNECT_TIMEOUT_MS);
+  }
+  /**
+   * Reads the access point's state and name with AIRFROG_CMD GET_WIFI_AP.
+   * @returns {Promise<{state: number, stations: number, ipv4: Uint8Array, ipv6: Uint8Array, ssid: string}>}
+   *          state is AP_ON when the access point is on. stations is the
+   *          number of devices connected to it
+   */
+  async getWifiAp() {
+    const response = await this.airfrogCmd(Command.GET_WIFI_AP, EMPTY, CONNECT_TIMEOUT_MS);
+    const f = decodeWifiAp(response);
+    if (!f) {
+      throw this.#fail(new AirfrogError("INVALID_MESSAGE", `${response.length}-byte GET_WIFI_AP response`));
+    }
+    return f;
+  }
+  /**
+   * Sets the access point's name and password with AIRFROG_CMD
+   * SET_WIFI_AP. Airfrog allows it only over the access point and fails
+   * it with NOT_PERMITTED elsewhere. If the access point is on, Airfrog
+   * then closes the connections over it with NETWORK_SETTINGS_CHANGED and
+   * restarts it with the new settings.
+   * @param {string} ssid - 1 to 32 bytes
+   * @param {string} password - 8 to 63 bytes
+   * @returns {Promise<void>}
+   */
+  async setWifiAp(ssid, password) {
+    await this.airfrogCmd(Command.SET_WIFI_AP, encodeSetWifiAp({ ssid, password }), CONNECT_TIMEOUT_MS);
   }
   /**
    * Reads the installed extensions with AIRFROG_CMD GET_EXTENSIONS.
@@ -3034,19 +3439,28 @@ var Airfrog = class _Airfrog extends EventTarget {
   }
   /**
    * Installs an extension image with EXT_BEGIN, EXT_WRITE and EXT_FINISH.
-   * An image whose extension is installed updates it.
+   * An image whose extension is installed updates it. Airfrog checks the
+   * signature against its release keys. It installs an unsigned image
+   * only over serial or the access point started with the recovery button,
+   * and fails it with NOT_PERMITTED elsewhere. `readSignedFile()` splits a
+   * signed file into its image and signature. A client sends a signature
+   * only when Airfrog has its key, `signatureFor()`, so an image signed
+   * with another key installs unsigned.
    * @param {Uint8Array} image - the extension image, unchanged
-   * @param {number} flags - ExtensionFlag's TAB and SIDE_LOADED
+   * @param {number} flags - SetExtensionFlag's TAB
+   * @param {Uint8Array|null} [signature] - the image's signature, null for
+   *        an unsigned image
    * @returns {Promise<void>}
    */
-  async installExtension(image, flags) {
+  async installExtension(image, flags, signature = null) {
     const max = this.getMaxTransfer();
     await this.#locked(async () => {
-      await this.#airfrogCmd(
-        Command.EXT_BEGIN,
-        encodeExtBegin({ size: image.length, sha256: sha256(image), flags }),
-        EXT_WRITE_TIMEOUT_MS
-      );
+      await this.#airfrogCmd(Command.EXT_BEGIN, encodeExtBegin({
+        size: image.length,
+        sha256: sha256(image),
+        flags,
+        signature: signature ?? UNSIGNED
+      }), EXT_WRITE_TIMEOUT_MS);
       for (let offset = 0; offset < image.length; offset += max) {
         await this.#airfrogCmd(
           Command.EXT_WRITE,
@@ -3287,6 +3701,13 @@ var Extension = class extends EventTarget {
     return this.#send(data, timeoutMs);
   }
 };
+function newPasswordKey(password, iterations) {
+  if (password === "") {
+    return { key: new Uint8Array(32), salt: new Uint8Array(SALT_LEN) };
+  }
+  const salt = crypto.getRandomValues(new Uint8Array(SALT_LEN));
+  return { key: passwordKey(password, salt, iterations), salt };
+}
 function checkPin(name) {
   if (new TextEncoder().encode(name).length > PIN_NAME_LEN) {
     throw new AirfrogError("PIN_NAME", name);
@@ -3343,20 +3764,6 @@ function describeServices(services) {
   });
 }
 
-// js/setup/bytes.js
-var encoder2 = new TextEncoder();
-var decoder2 = new TextDecoder();
-var FieldError = class extends Error {
-  constructor(what) {
-    super(UNRECOGNISED_REPLY);
-    this.detail = what;
-    this.name = "FieldError";
-  }
-};
-function hex2(bytes) {
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-}
-
 // js/setup/protocol.js
 var EMPTY2 = new Uint8Array(0);
 function need(fields, p, what) {
@@ -3379,7 +3786,13 @@ function parseHwInfo(p) {
 }
 function parseFwInfo(p) {
   const f = need(decodeFwInfo(p), p, "GET_FW_INFO response");
-  return { version: f.version.join("."), bootloader: f.bootloader, wamr: f.wamr.join("."), commit: f.commit ?? "" };
+  return {
+    version: f.version.join("."),
+    bootloader: f.bootloader,
+    wamr: f.wamr.join("."),
+    sha256: hex2(f.sha256),
+    commit: f.commit ?? ""
+  };
 }
 function errorText(e) {
   return e?.message ?? String(e);
@@ -3954,7 +4367,12 @@ function checkDownload(bytes, name, image) {
   if (bytes.length !== image.size || hex2(sha256(bytes)) !== image.sha256) {
     throw new ExtensionError(EXTENSIONS.CORRUPT);
   }
-  checkHeader(bytes, { name, model: image.model, wamr: image.wamr });
+  const file = readSignedFile(bytes, "extension");
+  if (!file) {
+    throw new ExtensionError(ERRORS.EXTENSION_INVALID());
+  }
+  checkHeader(file.image, { name, model: image.model, wamr: image.wamr });
+  return file;
 }
 function targetGroup(firmware, found) {
   if (!firmware.length) {
@@ -4103,6 +4521,29 @@ async function readZip(zip, { maxSize, maxTotal }, want = () => true) {
 // ui/src/extensions/package.js
 var MAX_ENTRY = 1024 * 1024;
 var MAX_TOTAL = 4 * 1024 * 1024;
+async function readExtensionFile(bytes, model, wamr) {
+  if (decodeExtImage(bytes)?.magic !== EXT_IMAGE_MAGIC) {
+    return { ...await readPackage(bytes, model, wamr), signature: null };
+  }
+  const file = readSignedFile(bytes, "extension");
+  const header = file && decodeExtImage(file.image);
+  if (!header) {
+    throw new ExtensionError(EXTENSIONS.INVALID_FILE);
+  }
+  const found = { model: header.model, wamr: wamrText(header.wamr) };
+  if (!pickImage([found], model, wamr)) {
+    throw new ExtensionError(ERRORS.EXTENSION_UNSUPPORTED());
+  }
+  let metadata = null;
+  try {
+    metadata = imageMetadata(file.image, checkHeader(file.image, { name: header.name, ...found }));
+  } catch (e) {
+  }
+  if (metadata?.name !== header.name) {
+    throw new ExtensionError(EXTENSIONS.INVALID_FILE);
+  }
+  return { metadata, image: file.image, signature: file.signature };
+}
 async function readPackage(bytes, model, wamr) {
   let files;
   try {
@@ -4162,7 +4603,7 @@ function stateText(wasmState) {
   }
   return wasmState === WasmState.RUNNING ? EXTENSIONS.RUNNING : EXTENSIONS.STOPPED;
 }
-var ExtensionsTab = class {
+var ExtensionsTab = class _ExtensionsTab {
   /** @type {Array<Installed>} */
   installed = [];
   /** @type {Map<string, object>|null} the checked extensions manifest */
@@ -4197,7 +4638,7 @@ var ExtensionsTab = class {
     this.none = h("p", { class: "note", hidden: true }, EXTENSIONS.NONE_INSTALLED);
     this.msg = message();
     this.confirm = prompt();
-    this.file = h("input", { type: "file", accept: ".afx", hidden: true, onchange: () => this.#chosen() });
+    this.file = h("input", { type: "file", accept: ".afx,.bin", hidden: true, onchange: () => this.#chosen() });
     this.addButton = button(EXTENSIONS.ADD, () => this.#showAdd(true));
     this.fileButton = button(EXTENSIONS.FROM_FILE, () => this.file.click());
     this.table = h(
@@ -4322,7 +4763,7 @@ var ExtensionsTab = class {
             throw err;
           }
         }
-        const sideLoaded = Boolean(e.flags & ExtensionFlag.SIDE_LOADED);
+        const unsigned = Boolean(e.flags & ExtensionFlag.UNSIGNED);
         items.push({
           name,
           flags: e.flags,
@@ -4332,7 +4773,7 @@ var ExtensionsTab = class {
           displayName: metadata?.display_name ?? name,
           version: metadata?.version ?? null,
           ui: null,
-          sideLoaded,
+          unsigned,
           tab: Boolean(e.flags & ExtensionFlag.TAB)
         });
       }
@@ -4351,7 +4792,7 @@ var ExtensionsTab = class {
    */
   #changed() {
     const local = isLocal(this.extensionsUrl);
-    this.installed = this.installed.map((x) => ({ ...x, ui: uiAddress(x.metadata?.ui, x.sideLoaded || local) }));
+    this.installed = this.installed.map((x) => ({ ...x, ui: uiAddress(x.metadata?.ui, x.unsigned || local) }));
     this.onChange(this.installed);
     this.render();
   }
@@ -4364,10 +4805,10 @@ var ExtensionsTab = class {
     this.rows.replaceChildren(...this.installed.map((x, i) => this.#row(x, i, disabled)));
     this.#renderAvail(disabled);
   }
-  /** The installed version's note: latest version, side-loaded or Depublished. */
+  /** The installed version's note, in brackets after it: latest version, unsigned or depublished. */
   #note(x) {
-    if (x.sideLoaded) {
-      return EXTENSIONS.SIDE_LOADED;
+    if (x.unsigned) {
+      return EXTENSIONS.UNSIGNED;
     }
     const entry = this.list?.get(x.name);
     if (!entry) {
@@ -4384,7 +4825,7 @@ var ExtensionsTab = class {
   #newer(x) {
     const entry = this.list?.get(x.name);
     const info = this.#info();
-    if (x.sideLoaded || !entry || entry.depublished || !info || !x.version) {
+    if (x.unsigned || !entry || entry.depublished || !info || !x.version) {
       return null;
     }
     const newest = latest(entry, info.model, info.wamr);
@@ -4393,7 +4834,7 @@ var ExtensionsTab = class {
   /** An installed extension's buttons in the installed list and in Install extensions. */
   #actions(x, disabled, msg, confirm) {
     const newer = this.#newer(x);
-    const reinstall = !x.sideLoaded && x.wasmReason === WasmReason.OTHER_WAMR_VERSION && (x.wasmState === WasmState.STOPPED || x.wasmState === WasmState.NOT_STARTED);
+    const reinstall = !x.unsigned && x.wasmReason === WasmReason.OTHER_WAMR_VERSION && (x.wasmState === WasmState.STOPPED || x.wasmState === WasmState.NOT_STARTED);
     return [
       x.ui ? button(EXTENSIONS.OPEN, () => this.openUi(x.name), { class: "small", disabled: !this.connected }) : null,
       newer ? this.#button(
@@ -4439,12 +4880,7 @@ var ExtensionsTab = class {
       { draggable: !disabled, class: "ext-row", "data-name": x.name },
       h("td", { class: "handle", "aria-hidden": "true" }, "\u283F"),
       h("td", {}, x.displayName),
-      h(
-        "td",
-        { class: "ver" },
-        x.version ? VALUES.VERSION(x.version) : VALUES.NONE,
-        note ? [" ", h("span", { class: "muted" }, note)] : null
-      ),
+      h("td", { class: "ver" }, note ? VALUES.WITH_NOTE(x.version ? VALUES.VERSION(x.version) : VALUES.NONE, note) : x.version ? VALUES.VERSION(x.version) : VALUES.NONE),
       h("td", {}, stateText(x.wasmState)),
       h("td", {}, tab),
       h("td", { class: "acts" }, ...this.#actions(x, disabled, this.msg, this.confirm))
@@ -4573,9 +5009,14 @@ var ExtensionsTab = class {
           throw new ExtensionError(ERRORS.EXTENSION_UNSUPPORTED());
         }
         msg.say(this.#progress(existing, chosen.metadata));
-        const bytes = await downloadImage(chosen.image.url);
-        checkDownload(bytes, name, chosen.image);
-        await this.#install(airfrog, bytes, chosen.metadata, false, msg);
+        const file = checkDownload(await downloadImage(chosen.image.url), name, chosen.image);
+        await this.#install(
+          airfrog,
+          file.image,
+          signatureFor(file.signature, airfrog.getReleaseKeys()),
+          chosen.metadata,
+          msg
+        );
       } catch (e) {
         msg.say(`${failed} ${errorText(e)}`, "bad");
       }
@@ -4585,13 +5026,20 @@ var ExtensionsTab = class {
     const version = VALUES.VERSION(metadata.version);
     return existing ? EXTENSIONS.UPDATING(metadata.display_name, version) : EXTENSIONS.INSTALLING(metadata.display_name, version);
   }
-  async #install(airfrog, image, metadata, sideLoaded, msg) {
+  /** Whether an image with signature, null for unsigned, can be installed over airfrog's connection. */
+  static #allowed(airfrog, signature) {
+    return Boolean(signature) || airfrog.getInterface() === Interface.AP_BUTTON;
+  }
+  async #install(airfrog, image, signature, metadata, msg) {
+    if (!_ExtensionsTab.#allowed(airfrog, signature)) {
+      throw new ExtensionError(EXTENSIONS.UNSIGNED_NOT_HERE);
+    }
     const existing = this.installed.find((x) => x.name === metadata.name);
-    const local = sideLoaded || isLocal(this.extensionsUrl);
+    const local = !signature || isLocal(this.extensionsUrl);
     const withUi = this.installed.filter((x) => x.ui).length;
     const tab = !existing && uiAddress(metadata.ui, local) && withUi < DEFAULT_TABS;
     msg.say(this.#progress(existing, metadata));
-    await airfrog.installExtension(image, (tab ? ExtensionFlag.TAB : 0) | (sideLoaded ? ExtensionFlag.SIDE_LOADED : 0));
+    await airfrog.installExtension(image, tab ? SetExtensionFlag.TAB : 0, signature);
     await this.refresh();
     const version = VALUES.VERSION(metadata.version);
     msg.say(existing ? EXTENSIONS.UPDATED(metadata.display_name, version) : EXTENSIONS.INSTALLED(metadata.display_name, version), "ok");
@@ -4612,31 +5060,44 @@ var ExtensionsTab = class {
       }
     });
   }
-  /** A package was chosen with Install from file: confirm, then install it. */
+  /**
+   * A file was chosen with Install from file: a package or an extension
+   * image. An unsigned one is confirmed first.
+   */
   async #chosen() {
     const file = this.file.files?.[0];
     this.file.value = "";
     if (!file || this.busy) {
       return;
     }
-    let pkg;
+    let chosen;
     try {
-      const info = await this.#readInfo(this.airfrog());
-      pkg = await readPackage(new Uint8Array(await file.arrayBuffer()), info.model, info.wamr);
+      const airfrog = this.airfrog();
+      const info = await this.#readInfo(airfrog);
+      chosen = await readExtensionFile(new Uint8Array(await file.arrayBuffer()), info.model, info.wamr);
+      chosen.signature = signatureFor(chosen.signature, airfrog.getReleaseKeys());
+      if (!_ExtensionsTab.#allowed(airfrog, chosen.signature)) {
+        throw new ExtensionError(EXTENSIONS.UNSIGNED_NOT_HERE);
+      }
     } catch (e) {
       this.msg.say(`${EXTENSIONS.INSTALL_FAILED} ${errorText(e)}`, "bad");
       return;
     }
     this.msg.say("");
-    this.confirm.ask(EXTENSIONS.SIDE_LOAD_CONFIRM, EXTENSIONS.INSTALL, () => this.#run(async () => {
-      const existing = this.installed.some((x) => x.name === pkg.metadata.name);
+    const install = () => this.#run(async () => {
+      const existing = this.installed.some((x) => x.name === chosen.metadata.name);
       try {
-        await this.#install(this.airfrog(), pkg.image, pkg.metadata, true, this.msg);
+        await this.#install(this.airfrog(), chosen.image, chosen.signature, chosen.metadata, this.msg);
       } catch (e) {
         const failed = existing ? EXTENSIONS.UPDATE_FAILED : EXTENSIONS.INSTALL_FAILED;
         this.msg.say(`${failed} ${errorText(e)}`, "bad");
       }
-    }));
+    });
+    if (chosen.signature) {
+      install();
+    } else {
+      this.confirm.ask(EXTENSIONS.UNSIGNED_CONFIRM, EXTENSIONS.INSTALL, install);
+    }
   }
 };
 function nameLink(m) {
@@ -4655,14 +5116,26 @@ async function downloadImage(url) {
 // ui/src/extensions/bridge.js
 var FORWARDED2 = /* @__PURE__ */ new Set([CLAIM, RELEASE, TARGET_CMD, IDENTIFY]);
 var GET_COMMANDS = new Set(Object.entries(Command).filter(([k]) => k.startsWith("GET_")).map(([, v]) => v));
-function isTrusted(origin) {
-  try {
-    const tld = new URL(AIRFROG_TLD);
-    const u = new URL(origin);
-    return u.protocol === tld.protocol && u.port === tld.port && (u.hostname === tld.hostname || u.hostname.endsWith(`.${tld.hostname}`));
-  } catch (e) {
-    return false;
+function isTrusted(origin, websites) {
+  return websites.some((w) => {
+    try {
+      return new URL(w).origin === origin;
+    } catch (e) {
+      return false;
+    }
+  });
+}
+function forwarded(type, payload, s) {
+  const cmd = type === AIRFROG_CMD ? decodeAirfrogCmd(payload) : null;
+  if (!s || cmd?.command !== Command.SET_PASSWORD || cmd.fields.length !== SET_PASSWORD_LEN) {
+    return payload;
   }
+  const fields = cmd.fields.slice();
+  const pad = hmacSha256(s, new TextEncoder().encode(PASSWORD_LABEL), fields.subarray(32));
+  for (let i = 0; i < 32; i++) {
+    fields[i] ^= pad[i];
+  }
+  return encodeAirfrogCmd({ command: cmd.command, fields });
 }
 function route(message2, name, trusted) {
   const { type, payload } = message2 ?? {};
@@ -4702,18 +5175,22 @@ var FrameLink = class {
    * @param {function(): Window|null} options.target - the frame's window
    * @param {function(): Promise<import('../../../js/awp.js').AwpSocket>} options.open -
    *        opens and logs in a new connection to Airfrog
+   * @param {function(): Array<string>} [options.fullAccess] - the
+   *        Airfrog manifest's full_access_websites, read at each
+   *        connection
    * @param {function()} [options.onConnect] - called on each connection
    *        request from the extension UI
    * @param {function(number)} [options.onHeight] - called with the
    *        extension UI's page height in pixels, which its open connection
    *        posts
    */
-  constructor({ name, origin, target, open, onConnect = () => {
+  constructor({ name, origin, target, open, fullAccess = () => [], onConnect = () => {
   }, onHeight = () => {
   } }) {
     this.name = name;
     this.origin = origin;
-    this.trusted = isTrusted(origin);
+    this.fullAccess = fullAccess;
+    this.trusted = false;
     this.target = target;
     this.open = open;
     this.onConnect = onConnect;
@@ -4751,7 +5228,8 @@ var FrameLink = class {
     switch (route(message2, this.name, this.trusted)) {
       case "forward":
         try {
-          this.#socket?.send(message2.type, message2.payload);
+          const socket = this.#socket;
+          socket?.send(message2.type, forwarded(message2.type, message2.payload, socket.key));
         } catch (e) {
         }
         return;
@@ -4825,6 +5303,7 @@ var FrameLink = class {
   }
   #attach(id, socket) {
     this.#socket = socket;
+    this.trusted = isTrusted(this.origin, this.fullAccess());
     socket.onclose = (error) => {
       if (this.#socket === socket) {
         this.#socket = null;
@@ -4864,13 +5343,16 @@ var ExtensionPane = class {
    * @param {string} options.ui - the extension UI's address, checked
    * @param {function(): Promise<object>} options.open - opens a logged-in
    *        AwpSocket to Airfrog
+   * @param {function(): Array<string>} [options.fullAccess] - the websites
+   *        whose extension UIs have every request forwarded
    * @param {{loadMs?: number, unloadMs?: number}} [options.times]
    */
-  constructor({ name, displayName, ui, open, times = {} }) {
+  constructor({ name, displayName, ui, open, fullAccess = () => [], times = {} }) {
     this.name = name;
     this.displayName = displayName;
     this.ui = ui;
     this.open = open;
+    this.fullAccess = fullAccess;
     this.loadMs = times.loadMs ?? LOAD_MS;
     this.unloadMs = times.unloadMs ?? UNLOAD_MS;
     this.state = "unloaded";
@@ -4933,6 +5415,7 @@ var ExtensionPane = class {
       origin,
       target: () => frame.contentWindow,
       open: this.open,
+      fullAccess: this.fullAccess,
       onConnect: () => this.#connected(),
       onHeight: (height) => {
         frame.style.height = `${height}px`;
@@ -5000,12 +5483,12 @@ var FullUi = class {
    * @param {object} options.setup - Airfrog's internal JS setup module, as Airfrog serves it
    * @param {object|null} [options.firmware] - the verified firmware manifest
    * @param {string|null} [options.firmwareError] - why there isn't one
-   * @param {function(): Promise<object>} [options.loadFirmware] - loads the
-   *        firmware manifest to check a chosen firmware file
    * @param {function(): Promise<{url: string, manifest: object}>} options.loadExtensions -
    *        loads and verifies the extensions manifest
    * @param {string|null} options.extensionsUrl - the extensions manifest's
    *        address, or null when the Airfrog manifest didn't load
+   * @param {function(): Array<string>} [options.fullAccess] - the
+   *        Airfrog manifest's full_access_websites, empty until it loads
    * @param {object} [options.session]
    * @param {string} [options.version] - this full user interface's version
    */
@@ -5013,15 +5496,16 @@ var FullUi = class {
     setup,
     firmware = null,
     firmwareError = null,
-    loadFirmware = null,
     loadExtensions,
     extensionsUrl,
+    fullAccess = () => [],
     session,
     version
   }) {
     this.login = null;
-    session ??= new setup.Session(location.host, { connect: async (host, password) => {
-      const airfrog = await Airfrog.connect(host, password);
+    this.fullAccess = fullAccess;
+    session ??= new setup.Session(location.host, { connect: async (host, password, { confirming = false } = {}) => {
+      const airfrog = await Airfrog.connect(host, password, confirming ? {} : { checkHello });
       this.login = { host, password, airfrog };
       airfrog.addEventListener("close", () => {
         if (this.login?.airfrog === airfrog) {
@@ -5029,14 +5513,13 @@ var FullUi = class {
         }
       });
       return airfrog;
-    } });
+    }, resetPassword: (host, password) => Airfrog.resetPassword(host, password, { checkHello }) });
     this.targetCard = new TargetCard(this);
     this.targetView = new TargetView();
     this.pinsView = new PinsView();
     this.page = new setup.Page({
       firmware,
       firmwareError,
-      loadFirmware,
       session,
       tabs: [{ id: "target", name: PAGE.TARGET_TAB, element: h("div", {}, this.targetCard.element) }],
       advanced: [this.targetView.element, this.pinsView.element],
@@ -5148,7 +5631,8 @@ var FullUi = class {
           name: x.name,
           displayName: x.displayName,
           ui: x.ui,
-          open: () => this.#openSocket()
+          open: () => this.#openSocket(),
+          fullAccess: this.fullAccess
         });
         this.extensionPanes.set(x.name, pane);
         this.#addTab(id, x.displayName, pane.element, "target");
@@ -5163,7 +5647,7 @@ var FullUi = class {
     if (!this.login || this.login.airfrog.isClosed()) {
       return Promise.reject(new AirfrogError("CLOSED"));
     }
-    return AwpSocket.open(this.login.host, this.login.password);
+    return AwpSocket.open(this.login.host, this.login.password, { checkHello });
   }
   get session() {
     return this.page.session;
@@ -6113,10 +6597,6 @@ var sha512 = /* @__PURE__ */ createHasher(
   /* @__PURE__ */ oidNist(3)
 );
 
-// commissioning/manifest-key.js
-var MANIFEST_KEY = "c44615e017975c65c1248565a67a4918e315aeab4fc0a67189b0f04692c6f85d";
-var AIRFROG_MANIFEST = "https://meta.piers.rocks/airfrog/manifest.json";
-
 // ui/src/manifests.js
 hashes.sha512 = sha512;
 var FIRMWARE_WORDS = {
@@ -6136,6 +6616,15 @@ var ManifestError = class extends Error {
   }
 };
 var isText2 = (v) => typeof v === "string" && v !== "";
+var KEY = /^[0-9a-f]{64}$/;
+var MANIFESTS = [
+  "ui_manifest",
+  "firmware_manifest",
+  "support_firmware_manifest",
+  "cli_manifest",
+  "extensions_manifest"
+];
+var isEntry = (v) => typeof v === "object" && v !== null && isText2(v.url) && (v.key === void 0 || KEY.test(v.key));
 function fromHex(s) {
   return new Uint8Array(s.match(/../g).map((b) => parseInt(b, 16)));
 }
@@ -6146,7 +6635,7 @@ async function fetched(url) {
     throw new ManifestError(downloadText(e), `${url}: ${e.message}`);
   }
 }
-function signedBy(minisig, body, key) {
+function signedBy(minisig, body, keys) {
   let signature;
   try {
     const line = new TextDecoder().decode(minisig).split("\n")[1];
@@ -6154,8 +6643,10 @@ function signedBy(minisig, body, key) {
   } catch (e) {
     return false;
   }
+  const id = Array.from(signature.subarray(2, 10), (b) => b.toString(16).padStart(2, "0")).join("");
+  const key = keys.find((k) => k.startsWith(id));
   try {
-    return signature.length === 74 && signature[0] === 69 && signature[1] === 100 && verify(signature.subarray(10), body, fromHex(key));
+    return signature.length === 74 && signature[0] === 69 && signature[1] === 100 && Boolean(key) && verify(signature.subarray(10), body, fromHex(key));
   } catch (e) {
     return false;
   }
@@ -6165,7 +6656,7 @@ function complete(m, type) {
     return false;
   }
   if (type === "airfrog") {
-    return isText2(m.ui_manifest) && isText2(m.firmware_manifest) && isText2(m.support_firmware_manifest) && isText2(m.cli_manifest) && isText2(m.extensions_manifest) && isText2(m.js_library) && m.js_library.endsWith("/");
+    return MANIFESTS.every((name) => isEntry(m[name])) && isText2(m.js_library) && m.js_library.endsWith("/") && Array.isArray(m.full_access_websites) && m.full_access_websites.every(isText2);
   }
   if (type === "extensions") {
     return typeof m.extensions === "object" && m.extensions !== null && !Array.isArray(m.extensions);
@@ -6175,22 +6666,25 @@ function complete(m, type) {
 var Manifests = class {
   /** The extensions manifest's address, from the Airfrog manifest once it loads, or null. */
   extensionsUrl = null;
+  /** The Airfrog manifest's full_access_websites, empty until it loads. */
+  fullAccessWebsites = [];
   #airfrog = null;
   #firmware = null;
   #extensions = null;
   /**
    * @param {object} [options]
    * @param {string} [options.url] - the Airfrog manifest's address
-   * @param {string} [options.key] - the manifest key's public half in hex
+   * @param {Array<string>} [options.keys] - the release keys in hex
    */
-  constructor({ url = AIRFROG_MANIFEST, key = MANIFEST_KEY } = {}) {
+  constructor({ url = AIRFROG_MANIFEST, keys = RELEASE_KEYS } = {}) {
     this.url = url;
-    this.key = key;
+    this.keys = keys;
   }
   /** The Airfrog manifest, loaded once, and again after a failure. */
   airfrog() {
-    this.#airfrog ??= this.#manifestAt(this.url, "airfrog").then((m) => {
-      this.extensionsUrl = m.extensions_manifest;
+    this.#airfrog ??= this.#manifestAt({ url: this.url }, "airfrog", this.keys).then((m) => {
+      this.extensionsUrl = m.extensions_manifest.url;
+      this.fullAccessWebsites = m.full_access_websites;
       return m;
     }).catch((e) => {
       this.#airfrog = null;
@@ -6214,23 +6708,36 @@ var Manifests = class {
   extensions() {
     this.#extensions ??= (async () => {
       try {
-        const url = (await this.airfrog()).extensions_manifest;
-        return { url, manifest: await this.#manifestAt(url, "extensions") };
+        const entry = (await this.airfrog()).extensions_manifest;
+        return { url: entry.url, manifest: await this.#manifestAt(entry, "extensions") };
       } finally {
         this.#extensions = null;
       }
     })();
     return this.#extensions;
   }
-  /** Fetches the manifest of type at url and its signature file, url.minisig, and verifies them. */
-  async #manifestAt(url, type) {
-    if (!this.key) {
-      throw new ManifestError(COMMISSIONING_FIRMWARE.MANIFEST_KEY_NOT_SET);
+  /**
+   * Fetches the manifest of type at entry.url. With keys, or entry.key,
+   * its signature file url.minisig is fetched too and verified. Without
+   * either, url must be https.
+   * @param {{url: string, key?: string}} entry
+   * @param {string} type
+   * @param {Array<string>} [keys] - the keys that may sign it
+   */
+  async #manifestAt({ url, key }, type, keys = key ? [key] : []) {
+    if (type === "airfrog" && !keys.length) {
+      throw new ManifestError(COMMISSIONING_FIRMWARE.RELEASE_KEYS_NOT_SET);
     }
     const words = type === "firmware" ? FIRMWARE_WORDS : MANIFEST_WORDS;
+    if (!keys.length && !url.startsWith("https://")) {
+      throw new ManifestError(words.invalid, `${url} has no key and isn't https`);
+    }
     const fresh = `?t=${Date.now()}`;
-    const [body, minisig] = await Promise.all([fetched(url + fresh), fetched(`${url}.minisig${fresh}`)]);
-    if (!signedBy(minisig, body, this.key)) {
+    const [body, minisig] = await Promise.all([
+      fetched(url + fresh),
+      keys.length ? fetched(`${url}.minisig${fresh}`) : null
+    ]);
+    if (keys.length && !signedBy(minisig, body, keys)) {
       throw new ManifestError(words.signature, url);
     }
     let manifest;
@@ -6251,7 +6758,7 @@ var Manifests = class {
 
 // ui/src/main.js
 var VERSION = true ? "0.1.0" : void 0;
-var SETUP_API = 2;
+var SETUP_API = 3;
 async function start({}) {
   const setup = await import(new URL("/setup.js", location.href).href);
   if (!(setup.API >= SETUP_API)) {
@@ -6273,7 +6780,7 @@ async function start({}) {
       )),
       h("main", {}, container)
     );
-    await startBridge(container);
+    await startBridge(container, { checkHello });
     return;
   }
   const manifests = new Manifests();
@@ -6288,9 +6795,9 @@ async function start({}) {
     setup,
     firmware,
     firmwareError,
-    loadFirmware: () => manifests.firmware(),
     loadExtensions: () => manifests.extensions(),
     extensionsUrl: manifests.extensionsUrl,
+    fullAccess: () => manifests.fullAccessWebsites,
     version: VERSION
   }).start();
 }
